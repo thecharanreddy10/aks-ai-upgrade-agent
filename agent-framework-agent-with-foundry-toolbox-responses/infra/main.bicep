@@ -21,6 +21,17 @@ param aksRoleDefinitionGuids array = [
 	'4abbcc35-e782-43d8-92c5-2d3f1bd2253f'
 ]
 
+@description('User-assigned managed identity name for the AKS MCP Container App (kept separate from the Function identity).')
+param aksMcpContainerAppIdentityName string = '${namePrefix}-containerapp-mi'
+
+@description('Built-in role definition GUIDs to assign to the Container App identity at AKS scope. Default: Reader only (covers all read/discovery/upgrade-profile lookups via the */read wildcard).')
+param aksContainerAppRoleDefinitionGuids array = [
+	'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+]
+
+@description('Assign Azure RBAC roles to the Container App identity on the target AKS resource when true.')
+param assignAksContainerAppRoles bool = true
+
 @description('Deploy Azure Functions hosting resources for the AKS MCP service.')
 param deployAksMcpFunction bool = true
 
@@ -62,6 +73,13 @@ var applicationInsightsName = !empty(aksMcpApplicationInsightsName)
 
 resource aksMcpIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
 	name: aksMcpIdentityName
+	location: location
+}
+
+// Dedicated identity for the aks-mcp Container App path (Phase 2 Task 4). Kept separate from
+// aksMcpIdentity (the Function App's identity) so Function RBAC is not touched by this change.
+resource aksMcpContainerAppIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+	name: aksMcpContainerAppIdentityName
 	location: location
 }
 
@@ -176,6 +194,31 @@ module aksRoleAssignmentModule './modules/aks-role-assignments.bicep' = if (!emp
 	}
 }
 
+// Reader for the Container App identity: covers aks_get_cluster_details, aks_get_node_pools,
+// and aks_get_available_upgrades (Reader's */read wildcard matches every read action these use).
+module aksContainerAppRoleAssignmentModule './modules/aks-role-assignments.bicep' = if (!empty(existingAksClusterResourceId) && assignAksContainerAppRoles) {
+	name: 'aks-containerapp-role-${uniqueString(existingAksClusterResourceId, aksMcpContainerAppIdentity.id)}'
+	scope: resourceGroup(aksSubscriptionId, aksResourceGroup)
+	params: {
+		aksClusterName: aksClusterName
+		principalId: aksMcpContainerAppIdentity.properties.principalId
+		roleDefinitionGuids: aksContainerAppRoleDefinitionGuids
+	}
+}
+
+// Custom role for the Container App identity: covers aks_check_node_health, aks_check_pod_health,
+// and aks_check_pdb, which all execute kubectl via AKS Run Command. Write RBAC for
+// aks_upgrade_node_pool's real (non-dry-run) path is intentionally NOT assigned yet; the exact
+// action for agent-pool writes was not confidently verified in this pass (see report).
+module aksContainerAppRunCommandRoleModule './modules/aks-run-command-role.bicep' = if (!empty(existingAksClusterResourceId) && assignAksContainerAppRoles) {
+	name: 'aks-containerapp-runcommand-${uniqueString(existingAksClusterResourceId, aksMcpContainerAppIdentity.id)}'
+	scope: resourceGroup(aksSubscriptionId, aksResourceGroup)
+	params: {
+		aksClusterName: aksClusterName
+		principalId: aksMcpContainerAppIdentity.properties.principalId
+	}
+}
+
 output deploymentLocation string = location
 output deploymentNamePrefix string = namePrefix
 output targetAksClusterResourceId string = existingAksClusterResourceId
@@ -189,3 +232,7 @@ output aksMcpFunctionAppEndpoint string = deployAksMcpFunction ? 'https://${aksM
 output AKS_MCP_FUNCTION_APP_NAME string = deployAksMcpFunction ? aksMcpFunctionApp.name : ''
 output AKS_MCP_FUNCTION_APP_ENDPOINT string = deployAksMcpFunction ? 'https://${aksMcpFunctionApp!.properties.defaultHostName}/api/mcp' : ''
 output AKS_MCP_IDENTITY_PRINCIPAL_ID string = aksMcpIdentity.properties.principalId
+output aksMcpContainerAppIdentityNameOut string = aksMcpContainerAppIdentity.name
+output aksMcpContainerAppIdentityResourceId string = aksMcpContainerAppIdentity.id
+output aksMcpContainerAppIdentityPrincipalId string = aksMcpContainerAppIdentity.properties.principalId
+output aksMcpContainerAppIdentityClientId string = aksMcpContainerAppIdentity.properties.clientId

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from azure.identity import DefaultAzureCredential
@@ -15,8 +16,13 @@ except ImportError:
 
 
 def get_container_service_client(subscription_id: str) -> ContainerServiceClient:
-    """Create a ContainerServiceClient using managed identity/default credentials."""
-    credential = DefaultAzureCredential()
+    """Create a ContainerServiceClient using managed identity/default credentials.
+
+    If AZURE_CLIENT_ID is set, it pins DefaultAzureCredential to that user-assigned
+    identity so resolution is unambiguous if more than one identity is ever attached.
+    """
+    client_id = os.getenv("AZURE_CLIENT_ID")
+    credential = DefaultAzureCredential(managed_identity_client_id=client_id) if client_id else DefaultAzureCredential()
     return ContainerServiceClient(credential=credential, subscription_id=subscription_id)
 
 

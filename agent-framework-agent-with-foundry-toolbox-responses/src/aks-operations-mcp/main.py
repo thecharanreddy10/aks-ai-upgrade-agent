@@ -21,6 +21,7 @@ from tools.validation import (
     aks_check_pdb as check_pdb_impl,
     aks_check_pod_health as check_pod_health_impl,
 )
+from tools.storage import aks_check_storage as check_storage_impl
 
 TOOLS = {
     "aks_get_cluster_details": get_cluster_details_impl,
@@ -31,6 +32,7 @@ TOOLS = {
     "aks_check_pdb": check_pdb_impl,
     "aks_validate_upgrade_readiness": validate_upgrade_readiness_impl,
     "aks_upgrade_node_pool": upgrade_node_pool_impl,
+    "aks_check_storage": check_storage_impl,
 }
 
 TOOL_SCHEMAS = {
@@ -119,6 +121,16 @@ TOOL_SCHEMAS = {
             "check_mode": {"type": "string", "enum": ["quick", "full"]},
         },
         "required": ["subscription_id", "resource_group", "cluster_name", "node_pool_name", "kubernetes_version"],
+    },
+    "aks_check_storage": {
+        "type": "object",
+        "properties": {
+            "subscription_id": {"type": "string"},
+            "resource_group": {"type": "string"},
+            "cluster_name": {"type": "string"},
+            "namespace": {"type": ["string", "null"]},
+        },
+        "required": ["subscription_id", "resource_group", "cluster_name"],
     },
 }
 

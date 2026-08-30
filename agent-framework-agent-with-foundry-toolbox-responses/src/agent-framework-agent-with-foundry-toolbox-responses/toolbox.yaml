@@ -32,3 +32,11 @@ tools:
     server_label: foundry-mcp
     project_connection_id: foundrymcpconn
     require_approval: "never"
+  - type: mcp
+    # AKS Operations MCP (this repo's src/aks-operations-mcp, deployed as the "aks-mcp"
+    # containerapp service in azure.yaml). No authentication required, same as noauth_mcp.
+    # Replace the URL below with the deployed endpoint, format:
+    # https://aks-mcp.<env>.<region>.azurecontainerapps.io/mcp (see AKS_MCP_ENDPOINT in next-steps.md)
+    server_label: aks-mcp
+    server_url: "<AKS_MCP_ENDPOINT>"
+    require_approval: "never"

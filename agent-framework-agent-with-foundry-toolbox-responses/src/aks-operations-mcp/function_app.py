@@ -12,6 +12,8 @@ from typing import Any, Callable
 import azure.functions as func
 
 from tools.discovery import aks_get_available_upgrades, aks_get_cluster_details, aks_get_node_pools
+from tools.storage import aks_check_storage
+from tools.upgrade import aks_upgrade_node_pool, aks_validate_upgrade_readiness
 from tools.validation import aks_check_node_health, aks_check_pdb, aks_check_pod_health
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -23,6 +25,9 @@ TOOLS: dict[str, Callable[..., dict[str, Any]]] = {
     "aks_check_node_health": aks_check_node_health,
     "aks_check_pod_health": aks_check_pod_health,
     "aks_check_pdb": aks_check_pdb,
+    "aks_validate_upgrade_readiness": aks_validate_upgrade_readiness,
+    "aks_upgrade_node_pool": aks_upgrade_node_pool,
+    "aks_check_storage": aks_check_storage,
 }
 
 TOOL_SCHEMAS = {
@@ -73,6 +78,46 @@ TOOL_SCHEMAS = {
         "required": ["subscription_id", "resource_group", "cluster_name"],
     },
     "aks_check_pdb": {
+        "type": "object",
+        "properties": {
+            "subscription_id": {"type": "string"},
+            "resource_group": {"type": "string"},
+            "cluster_name": {"type": "string"},
+            "namespace": {"type": ["string", "null"]},
+        },
+        "required": ["subscription_id", "resource_group", "cluster_name"],
+    },
+    "aks_validate_upgrade_readiness": {
+        "type": "object",
+        "properties": {
+            "subscription_id": {"type": "string"},
+            "resource_group": {"type": "string"},
+            "cluster_name": {"type": "string"},
+            "namespace": {"type": ["string", "null"]},
+            "maintenance_window_start_utc": {"type": ["string", "null"]},
+            "maintenance_window_end_utc": {"type": ["string", "null"]},
+            "check_mode": {"type": "string", "enum": ["quick", "full"]},
+        },
+        "required": ["subscription_id", "resource_group", "cluster_name"],
+    },
+    "aks_upgrade_node_pool": {
+        "type": "object",
+        "properties": {
+            "subscription_id": {"type": "string"},
+            "resource_group": {"type": "string"},
+            "cluster_name": {"type": "string"},
+            "node_pool_name": {"type": "string"},
+            "kubernetes_version": {"type": "string"},
+            "namespace": {"type": ["string", "null"]},
+            "dry_run": {"type": "boolean"},
+            "approval_token": {"type": ["string", "null"]},
+            "maintenance_window_start_utc": {"type": ["string", "null"]},
+            "maintenance_window_end_utc": {"type": ["string", "null"]},
+            "check_mode": {"type": "string", "enum": ["quick", "full"]},
+        },
+        "required": ["subscription_id", "resource_group", "cluster_name", "node_pool_name", "kubernetes_version"],
+    },
+    "aks_check_storage": {
         "type": "object",
         "properties": {
             "subscription_id": {"type": "string"},
