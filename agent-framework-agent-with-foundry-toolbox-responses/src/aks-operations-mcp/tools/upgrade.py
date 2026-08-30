@@ -1,0 +1,200 @@
+"""Upgrade tools for AKS operations with built-in safety guardrails."""
+
+from __future__ import annotations
+
+import os
+from datetime import UTC, datetime
+from typing import Any
+
+from tools.common import get_container_service_client
+from tools.validation import aks_check_node_health, aks_check_pdb, aks_check_pod_health
+
+
+def aks_validate_upgrade_readiness(
+    subscription_id: str,
+    resource_group: str,
+    cluster_name: str,
+    namespace: str | None = None,
+    maintenance_window_start_utc: str | None = None,
+    maintenance_window_end_utc: str | None = None,
+    check_mode: str = "quick",
+) -> dict[str, Any]:
+    """Run pre-upgrade health and safety checks.
+
+    Returns a structured readiness report and blocking reasons.
+    """
+    if check_mode not in {"quick", "full"}:
+        raise ValueError("check_mode must be 'quick' or 'full'.")
+
+    node_health: dict[str, Any] = {}
+    pod_health: dict[str, Any] = {}
+    pdb_health: dict[str, Any] = {}
+    deep_check_errors: list[str] = []
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    if check_mode == "full":
+        try:
+            node_health = aks_check_node_health(subscription_id, resource_group, cluster_name)
+            if node_health.get("unhealthy_nodes"):
+                blockers.append("Unhealthy nodes detected.")
+        except Exception as exc:  # noqa: BLE001
+            deep_check_errors.append(f"node_health_check_failed: {exc}")
+
+        try:
+            pod_health = aks_check_pod_health(subscription_id, resource_group, cluster_name, namespace)
+            if pod_health.get("unhealthy_pods"):
+                blockers.append("Unhealthy pods detected.")
+        except Exception as exc:  # noqa: BLE001
+            deep_check_errors.append(f"pod_health_check_failed: {exc}")
+
+        try:
+            pdb_health = aks_check_pdb(subscription_id, resource_group, cluster_name, namespace)
+            if not pdb_health.get("is_upgrade_safe", False):
+                blockers.append("PodDisruptionBudget constraints currently block disruption.")
+        except Exception as exc:  # noqa: BLE001
+            deep_check_errors.append(f"pdb_check_failed: {exc}")
+
+        if deep_check_errors:
+            blockers.append("One or more deep checks failed to execute.")
+    else:
+        warnings.append("Deep health checks were skipped in quick mode.")
+
+    in_window = True
+    if maintenance_window_start_utc and maintenance_window_end_utc:
+        in_window = _is_within_maintenance_window(maintenance_window_start_utc, maintenance_window_end_utc)
+        if not in_window:
+            blockers.append("Current UTC time is outside the configured maintenance window.")
+
+    return {
+        "subscription_id": subscription_id,
+        "resource_group": resource_group,
+        "cluster_name": cluster_name,
+        "namespace": namespace or "all-namespaces",
+        "check_mode": check_mode,
+        "maintenance_window": {
+            "start_utc": maintenance_window_start_utc,
+            "end_utc": maintenance_window_end_utc,
+            "in_window": in_window,
+        },
+        "readiness": {
+            "is_ready": len(blockers) == 0,
+            "blockers": blockers,
+            "warnings": warnings,
+        },
+        "deep_check_errors": deep_check_errors,
+        "node_health": node_health,
+        "pod_health": pod_health,
+        "pdb_health": pdb_health,
+    }
+
+
+def aks_upgrade_node_pool(
+    subscription_id: str,
+    resource_group: str,
+    cluster_name: str,
+    node_pool_name: str,
+    kubernetes_version: str,
+    namespace: str | None = None,
+    dry_run: bool = True,
+    approval_token: str | None = None,
+    maintenance_window_start_utc: str | None = None,
+    maintenance_window_end_utc: str | None = None,
+    check_mode: str = "quick",
+) -> dict[str, Any]:
+    """Execute a controlled node pool upgrade with safety gates.
+
+    Guardrails:
+    - Health gates must pass.
+    - Defaults to dry-run mode.
+    - Non-dry-run requires env gate + approval token validation.
+    """
+    readiness = aks_validate_upgrade_readiness(
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+        cluster_name=cluster_name,
+        namespace=namespace,
+        maintenance_window_start_utc=maintenance_window_start_utc,
+        maintenance_window_end_utc=maintenance_window_end_utc,
+        check_mode=check_mode,
+    )
+
+    if not readiness["readiness"]["is_ready"]:
+        return {
+            "status": "blocked",
+            "reason": "precheck_failed",
+            "requested_upgrade": {
+                "cluster_name": cluster_name,
+                "node_pool_name": node_pool_name,
+                "kubernetes_version": kubernetes_version,
+                "dry_run": dry_run,
+            },
+            "readiness": readiness,
+        }
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "message": "Prechecks passed. No write operation executed.",
+            "requested_upgrade": {
+                "cluster_name": cluster_name,
+                "node_pool_name": node_pool_name,
+                "kubernetes_version": kubernetes_version,
+                "dry_run": True,
+                "check_mode": check_mode,
+            },
+            "readiness": readiness,
+        }
+
+    if check_mode != "full":
+        raise PermissionError("Write operations require check_mode='full'.")
+
+    if os.getenv("AKS_UPGRADE_ENABLE_WRITE", "false").lower() != "true":
+        raise PermissionError("Upgrade write operations are disabled. Set AKS_UPGRADE_ENABLE_WRITE=true to enable.")
+
+    expected_token = os.getenv("AKS_UPGRADE_APPROVAL_TOKEN")
+    if expected_token and approval_token != expected_token:
+        raise PermissionError("Invalid approval token for upgrade execution.")
+
+    client = get_container_service_client(subscription_id)
+    pool = client.agent_pools.get(resource_group, cluster_name, node_pool_name)
+    pool.orchestrator_version = kubernetes_version
+
+    try:
+        poller = client.agent_pools.begin_create_or_update(
+            resource_group_name=resource_group,
+            resource_name=cluster_name,
+            agent_pool_name=node_pool_name,
+            parameters=pool,
+        )
+    except TypeError:
+        poller = client.agent_pools.begin_create_or_update(resource_group, cluster_name, node_pool_name, pool)
+
+    return {
+        "status": "started",
+        "message": "Node pool upgrade request accepted.",
+        "requested_upgrade": {
+            "cluster_name": cluster_name,
+            "node_pool_name": node_pool_name,
+            "kubernetes_version": kubernetes_version,
+            "dry_run": False,
+        },
+        "poller_status": poller.status(),
+        "readiness": readiness,
+    }
+
+
+def _is_within_maintenance_window(start_utc: str, end_utc: str) -> bool:
+    """Return whether current UTC time falls within [start_utc, end_utc].
+
+    Format: HH:MM (24-hour). Supports windows crossing midnight.
+    """
+    now = datetime.now(UTC).time()
+    start = datetime.strptime(start_utc, "%H:%M").time()
+    end = datetime.strptime(end_utc, "%H:%M").time()
+
+    if start <= end:
+        return start <= now <= end
+
+    return now >= start or now <= end
