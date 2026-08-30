@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from tools.common import get_container_service_client
+from tools.storage import aks_check_storage
 from tools.validation import aks_check_node_health, aks_check_pdb, aks_check_pod_health
 
 
@@ -29,6 +30,7 @@ def aks_validate_upgrade_readiness(
     node_health: dict[str, Any] = {}
     pod_health: dict[str, Any] = {}
     pdb_health: dict[str, Any] = {}
+    storage_health: dict[str, Any] = {}
     deep_check_errors: list[str] = []
 
     blockers: list[str] = []
@@ -55,6 +57,13 @@ def aks_validate_upgrade_readiness(
                 blockers.append("PodDisruptionBudget constraints currently block disruption.")
         except Exception as exc:  # noqa: BLE001
             deep_check_errors.append(f"pdb_check_failed: {exc}")
+
+        try:
+            storage_health = aks_check_storage(subscription_id, resource_group, cluster_name, namespace)
+            blockers.extend(storage_health.get("blockers", []))
+            warnings.extend(storage_health.get("warnings", []))
+        except Exception as exc:  # noqa: BLE001
+            deep_check_errors.append(f"storage_health_check_failed: {exc}")
 
         if deep_check_errors:
             blockers.append("One or more deep checks failed to execute.")
@@ -87,6 +96,7 @@ def aks_validate_upgrade_readiness(
         "node_health": node_health,
         "pod_health": pod_health,
         "pdb_health": pdb_health,
+        "storage_health": storage_health,
     }
 
 
