@@ -33,25 +33,9 @@ def run_kubectl_json(
     kubectl_arguments: str,
 ) -> dict[str, Any]:
     """Run a kubectl command through AKS run command and parse JSON output."""
-    client = get_container_service_client(subscription_id)
-
     full_command = f"kubectl {kubectl_arguments} -o json"
-    request_obj = RunCommandRequest(command=full_command)
-    try:
-        poller = client.managed_clusters.begin_run_command(
-            resource_group_name=resource_group,
-            resource_name=cluster_name,
-            request_payload=request_obj,
-        )
-    except TypeError:
-        poller = client.managed_clusters.begin_run_command(
-            resource_group_name=resource_group,
-            resource_name=cluster_name,
-            request=request_obj,
-        )
-    result = poller.result()
+    raw_logs = _execute_run_command(subscription_id, resource_group, cluster_name, full_command)
 
-    raw_logs = getattr(result, "logs", None)
     if not raw_logs:
         raise RuntimeError("AKS run command did not return logs output.")
 
@@ -91,3 +75,48 @@ def _extract_json_payload(output: str) -> str:
         raise ValueError("Invalid JSON boundaries in command output.")
 
     return output[start : end + 1]
+
+
+def _execute_run_command(
+    subscription_id: str,
+    resource_group: str,
+    cluster_name: str,
+    command: str,
+) -> str | None:
+    """Submit a single AKS Run Command invocation and return its raw log text."""
+    client = get_container_service_client(subscription_id)
+    request_obj = RunCommandRequest(command=command)
+    try:
+        poller = client.managed_clusters.begin_run_command(
+            resource_group_name=resource_group,
+            resource_name=cluster_name,
+            request_payload=request_obj,
+        )
+    except TypeError:
+        poller = client.managed_clusters.begin_run_command(
+            resource_group_name=resource_group,
+            resource_name=cluster_name,
+            request=request_obj,
+        )
+    result = poller.result()
+    return getattr(result, "logs", None)
+
+
+def run_kubectl_raw(
+    subscription_id: str,
+    resource_group: str,
+    cluster_name: str,
+    command: str,
+) -> str:
+    """Run an arbitrary shell/kubectl command through AKS run command; return raw log text as-is.
+
+    Unlike run_kubectl_json, this does not assume `-o json` output and performs no JSON parsing -
+    intended for compact, custom-formatted batched queries (e.g. deprecated API detection) where
+    the caller controls the exact output format and needs a single Run Command invocation to cover
+    multiple checks instead of one invocation per check (AKS Run Command has ~25-35s per-invocation
+    overhead, so batching is the primary lever for reducing wall-clock time).
+    """
+    raw_logs = _execute_run_command(subscription_id, resource_group, cluster_name, command)
+    if not raw_logs:
+        raise RuntimeError("AKS run command did not return logs output.")
+    return raw_logs

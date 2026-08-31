@@ -3,15 +3,24 @@
 Detection approach (see POC-PROGRESS.md for the full rationale):
 - `kubectl api-resources` alone only shows what the CURRENT server serves; it cannot tell us
   whether an API still in use will be removed by a future target version. Instead, for each
-  entry in KNOWN_API_DEPRECATIONS below we run a targeted `kubectl get <plural>.<version>.<group>`
-  query (reusing tools.common.run_kubectl_json / AKS Run Command, same as every other tool in
-  this package) to find real objects still using that old apiVersion.
+  entry in KNOWN_API_DEPRECATIONS below we check for real objects still using that old apiVersion.
 - The target Kubernetes version is compared against each entry's documented deprecated_in/
   removed_in Kubernetes release to classify severity. This mapping cannot be derived from the
   live cluster (the target version doesn't exist yet from the cluster's point of view), so a
   small, explicitly maintained table is required - kept intentionally short (well-known,
   high-impact removals only) rather than an exhaustive compatibility matrix.
 - Source: https://kubernetes.io/docs/reference/using-api/deprecation-guide/
+
+Performance note (2026-08-31): AKS Run Command has ~25-35s of per-invocation overhead. The
+original implementation issued one Run Command per matrix entry (17 calls, measured at 546s
+against the real cluster). This was replaced with a single batched Run Command (see
+_build_batch_script) that checks every relevant entry in one invocation, using compact
+`-o name` + count output only - never full object JSON - to stay well below AKS Run Command's
+output size limit. Each entry's kubectl exit code is captured separately from its output so an
+unavailable/removed API (non-zero exit) is never confused with zero matching objects (exit 0,
+count 0). This does trade away the previous per-object namespace/name detail (only counts are
+now reported per API version) in exchange for the single-invocation design; classification
+accuracy (BLOCKER/WARNING) is unchanged.
 """
 
 from __future__ import annotations
@@ -19,7 +28,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from tools.common import run_kubectl_json
+from tools.common import run_kubectl_raw
 from tools.discovery import aks_get_cluster_details
 
 # Each entry: the deprecated/removed GroupVersionKind, whether it's namespaced, the Kubernetes
@@ -120,6 +129,50 @@ def determine_deprecated_api_health(blockers: list[str], warnings: list[str]) ->
     return "HEALTHY"
 
 
+_NAMESPACE_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+
+
+def _validate_namespace(namespace: str) -> None:
+    """Reject anything that isn't a valid Kubernetes namespace name (RFC 1123 label).
+
+    namespace ends up embedded in a shell command run via AKS Run Command, so this also
+    prevents shell-metacharacter injection via this parameter.
+    """
+    if not isinstance(namespace, str) or len(namespace) > 63 or not _NAMESPACE_RE.match(namespace):
+        raise ValueError(f"Invalid Kubernetes namespace: {namespace!r}")
+
+
+_ENTRY_BLOCK_RE = re.compile(r"===ENTRY:(\d+)===\s*EXIT=(-?\d+)\s+COUNT=(\d+)")
+
+
+def _build_batch_script(entries: list[dict[str, Any]], ns_flag: str) -> str:
+    """Build one shell script that checks every given matrix entry in a single Run Command.
+
+    For each entry: captures kubectl's exit code separately from its output (so a removed/
+    unavailable API - non-zero exit - is never confused with zero matching objects), and emits
+    only a compact object count via `-o name` - never full object JSON.
+    """
+    lines: list[str] = []
+    for index, entry in enumerate(entries):
+        scope_flag = ns_flag if entry["namespaced"] else ""
+        gvk = f"{entry['plural']}.{entry['version']}.{entry['group']}"
+        get_args = re.sub(r"\s+", " ", f"get '{gvk}' {scope_flag} --ignore-not-found -o name".strip())
+        lines.append(f"echo '===ENTRY:{index}==='")
+        lines.append(f"RAW=$(kubectl {get_args} 2>/dev/null)")
+        lines.append("CODE=$?")
+        lines.append("COUNT=$(printf '%s\\n' \"$RAW\" | grep -c '.')")
+        lines.append('echo "EXIT=$CODE COUNT=$COUNT"')
+    return "\n".join(lines)
+
+
+def _parse_batch_output(raw_output: str) -> dict[int, tuple[int, int]]:
+    """Parse the compact batched script output into {entry_index: (exit_code, count)}."""
+    return {
+        int(match.group(1)): (int(match.group(2)), int(match.group(3)))
+        for match in _ENTRY_BLOCK_RE.finditer(raw_output)
+    }
+
+
 def aks_check_deprecated_apis(
     subscription_id: str,
     resource_group: str,
@@ -129,10 +182,18 @@ def aks_check_deprecated_apis(
 ) -> dict[str, Any]:
     """Detect Kubernetes API usage that is deprecated or removed relative to a target version.
 
+    All relevant matrix entries are checked in a SINGLE AKS Run Command invocation (see
+    _build_batch_script) rather than one invocation per entry - see the module docstring for why.
+    Findings report a count per API version rather than individual namespace/name detail, since
+    the batched query only requests compact counts (never full object JSON).
+
     If target_version is not supplied, the cluster's own current kubernetes_version is used
     (via aks_get_cluster_details) as the safest non-invented reference point - this reports
     what is already deprecated/removed as of today rather than guessing a future upgrade target.
     """
+    if namespace is not None:
+        _validate_namespace(namespace)
+
     if target_version is not None:
         target_major_minor = _parse_major_minor(target_version)
         resolved_target_version = target_version
@@ -145,34 +206,57 @@ def aks_check_deprecated_apis(
 
     ns_flag = f"-n {namespace}" if namespace else "-A"
 
-    findings: list[dict[str, Any]] = []
-    query_errors: list[str] = []
+    relevant: list[tuple[dict[str, Any], dict[str, Any]]] = []
     checked_api_versions: list[str] = []
-
     for entry in KNOWN_API_DEPRECATIONS:
         classification = classify_entry(entry, target_major_minor, resolved_target_version)
         if classification is None:
             continue
+        relevant.append((entry, classification))
+        checked_api_versions.append(f"{entry['group']}/{entry['version']} {entry['kind']}")
 
-        api_version = f"{entry['group']}/{entry['version']}"
-        checked_api_versions.append(f"{api_version} {entry['kind']}")
-        scope_flag = ns_flag if entry["namespaced"] else ""
-        get_command = f"get {entry['plural']}.{entry['version']}.{entry['group']} {scope_flag}".strip()
+    findings: list[dict[str, Any]] = []
+    query_errors: list[str] = []
+    run_command_invocations = 0
 
+    if relevant:
+        script = _build_batch_script([entry for entry, _classification in relevant], ns_flag)
         try:
-            payload = run_kubectl_json(subscription_id, resource_group, cluster_name, get_command)
-        except Exception as exc:  # noqa: BLE001 - API/resource absent or unqueryable is informational, not fatal
-            query_errors.append(f"{api_version} {entry['kind']}: {exc}")
-            continue
+            raw_output = run_kubectl_raw(subscription_id, resource_group, cluster_name, script)
+            run_command_invocations = 1
+        except Exception as exc:  # noqa: BLE001 - batch call failure is informational, not fatal
+            query_errors.append(f"batched deprecated-API check failed: {exc}")
+            raw_output = ""
 
-        for item in payload.get("items", []):
-            metadata = item.get("metadata", {})
+        parsed = _parse_batch_output(raw_output) if raw_output else {}
+
+        for index, (entry, classification) in enumerate(relevant):
+            api_version = f"{entry['group']}/{entry['version']}"
+
+            if index not in parsed:
+                query_errors.append(
+                    f"{api_version} {entry['kind']}: no result returned for this entry in the batched output."
+                )
+                continue
+
+            exit_code, count = parsed[index]
+            if exit_code != 0:
+                # Non-zero exit means the API/resource type is unavailable on this cluster (e.g.
+                # already removed) - this must NOT be read as evidence that no such resources exist.
+                query_errors.append(
+                    f"{api_version} {entry['kind']}: API not available/servable on this cluster "
+                    f"(kubectl exit code {exit_code}); usage could not be confirmed."
+                )
+                continue
+
+            if count <= 0:
+                continue
+
             findings.append(
                 {
-                    "namespace": metadata.get("namespace"),
-                    "name": metadata.get("name"),
                     "kind": entry["kind"],
                     "api_version": api_version,
+                    "count": count,
                     "target_kubernetes_version": resolved_target_version,
                     "severity": classification["severity"],
                     "status": classification["status"],
@@ -184,8 +268,9 @@ def aks_check_deprecated_apis(
     blockers: list[str] = []
     warnings: list[str] = []
     for finding in findings:
-        identifier = f"{finding['namespace']}/{finding['name']}" if finding["namespace"] else finding["name"]
-        message = f"{finding['kind']} {identifier} ({finding['api_version']}): {finding['reason']}"
+        message = (
+            f"{finding['kind']} ({finding['api_version']}): {finding['count']} object(s) found. {finding['reason']}"
+        )
         (blockers if finding["severity"] == "BLOCKER" else warnings).append(message)
 
     recommendations: list[str] = []
@@ -207,9 +292,11 @@ def aks_check_deprecated_apis(
         "target_version_source": target_version_source,
         "deprecated_api_health": determine_deprecated_api_health(blockers, warnings),
         "checked_api_versions": checked_api_versions,
+        "run_command_invocations": run_command_invocations,
         "findings": findings,
         "query_errors": query_errors,
         "blockers": blockers,
         "warnings": warnings,
         "recommendations": recommendations,
     }
+
