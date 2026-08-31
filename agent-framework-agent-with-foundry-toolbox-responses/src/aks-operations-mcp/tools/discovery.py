@@ -120,7 +120,8 @@ def aks_get_available_upgrades(subscription_id: str, resource_group: str, cluste
                         "kubernetes_version": item.kubernetes_version,
                         "is_preview": getattr(item, "is_preview", False),
                     }
-                    for item in getattr(control_plane_profile, "upgrades", [])
+                    # Azure may return upgrades=None (not an empty list) when no upgrades are available.
+                    for item in (getattr(control_plane_profile, "upgrades", None) or [])
                 ]
         except Exception as exc:  # noqa: BLE001
             upgrade_errors.append(f"control-plane profile unavailable: {exc}")
@@ -136,7 +137,8 @@ def aks_get_available_upgrades(subscription_id: str, resource_group: str, cluste
                         "is_preview": getattr(item, "is_preview", False),
                         "node_image_version": getattr(item, "node_image_version", None),
                     }
-                    for item in getattr(pool_profile, "upgrades", [])
+                    # Azure may return upgrades=None (not an empty list) when no upgrades are available.
+                    for item in (getattr(pool_profile, "upgrades", None) or [])
                 ]
             except Exception as exc:  # noqa: BLE001
                 upgrade_errors.append(f"node pool '{pool.name}' profile unavailable: {exc}")

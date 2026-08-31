@@ -56,7 +56,21 @@ def run_kubectl_json(
         raise RuntimeError("AKS run command did not return logs output.")
 
     payload = _extract_json_payload(raw_logs)
-    return json.loads(payload)
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        # AKS Run Command has a known output size limit (observed at 524288 bytes); output at or
+        # near that size is likely truncated mid-object rather than genuinely malformed JSON.
+        truncation_hint = (
+            " Output length is at/near AKS Run Command's known output size limit; the result was "
+            "likely truncated. Retry with a namespace-scoped query (-n <namespace>) instead of -A."
+            if len(raw_logs) >= 524288
+            else ""
+        )
+        raise RuntimeError(
+            f"Failed to parse kubectl JSON output for '{full_command}' (raw output length={len(raw_logs)}): {exc}."
+            f"{truncation_hint}"
+        ) from exc
 
 
 def _extract_json_payload(output: str) -> str:
