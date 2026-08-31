@@ -12,7 +12,12 @@ import pytest
 
 from tools import storage
 from tools.storage import (
+    _extract_event_storage_rows,
     _extract_items,
+    _extract_pod_storage_rows,
+    _parse_event_storage_rows,
+    _parse_pod_storage_rows,
+    _parse_storage_batch_output,
     _validate_namespace,
     aks_check_storage,
     classify_pvcs,
@@ -197,6 +202,29 @@ def test_storage_class_summary_is_informational_only():
     assert by_name["managed-premium"]["volume_binding_mode"] == "WaitForFirstConsumer"
 
 
+# --- determine_storage_health precedence tests (2026-08-31 correctness fix) ---
+
+
+def test_determine_storage_health_healthy_when_nothing_present():
+    assert determine_storage_health([], [], []) == "HEALTHY"
+    assert determine_storage_health([], []) == "HEALTHY"  # query_errors defaults to None
+
+
+def test_determine_storage_health_query_errors_only_is_incomplete():
+    """A query failure with no confirmed findings must be INCOMPLETE, never HEALTHY."""
+    assert determine_storage_health([], [], ["pods: no result returned in the batched output."]) == "INCOMPLETE"
+
+
+def test_determine_storage_health_blockers_and_query_errors_is_blocked():
+    """A confirmed blocker takes precedence over an unrelated query error."""
+    assert determine_storage_health(["PVC blocked"], [], ["events: query failed"]) == "BLOCKED"
+
+
+def test_determine_storage_health_warnings_and_query_errors_is_warning():
+    """A confirmed warning (no blockers) takes precedence over an unrelated query error."""
+    assert determine_storage_health([], ["PV orphaned"], ["events: query failed"]) == "WARNING"
+
+
 # --- Batching/parser tests for the single-Run-Command aks_check_storage (2026-08-31) ---
 
 
@@ -204,9 +232,27 @@ def _items_json(items: list[dict]) -> str:
     return json.dumps({"items": items})
 
 
-def _healthy_batch() -> dict[str, tuple[int, str]]:
-    empty = _items_json([])
-    return {"pvc": (0, empty), "pv": (0, empty), "storageclass": (0, empty), "pods": (0, empty), "events": (0, empty)}
+def _batch_raw_output(sections: dict[str, tuple[int, str]]) -> str:
+    """Build the combined multi-section script output aks_check_storage parses in one pass."""
+    lines: list[str] = []
+    for label, (code, body) in sections.items():
+        lines.append(f"===BEGIN:{label}===")
+        lines.append(body)
+        lines.append(f"===END:{label}:EXIT={code}===")
+    return "\n".join(lines)
+
+
+def _healthy_raw_output() -> str:
+    empty_items = _items_json([])
+    return _batch_raw_output(
+        {
+            "pvc": (0, empty_items),
+            "pv": (0, empty_items),
+            "storageclass": (0, empty_items),
+            "pods": (0, ""),
+            "events": (0, ""),
+        }
+    )
 
 
 def test_extract_items_parses_successful_query():
@@ -256,15 +302,17 @@ def test_invalid_namespace_raises():
 
 
 def test_aks_check_storage_uses_a_single_batched_run_command(monkeypatch):
-    """All 5 queries must be issued via exactly one run_kubectl_batch call."""
+    """All 5 queries must be issued via exactly one run_kubectl_raw call (one script)."""
     call_count = {"n": 0}
 
-    def fake_batch(subscription_id, resource_group, cluster_name, queries):
+    def fake_raw(subscription_id, resource_group, cluster_name, script):
         call_count["n"] += 1
-        assert set(queries.keys()) == {"pvc", "pv", "storageclass", "pods", "events"}
-        return _healthy_batch()
+        for label in ("pvc", "pv", "storageclass", "pods", "events"):
+            assert f"===BEGIN:{label}===" in script
+        assert "-o jsonpath=" in script  # pods/events must use compact rows, never -o json
+        return _healthy_raw_output()
 
-    monkeypatch.setattr(storage, "run_kubectl_batch", fake_batch)
+    monkeypatch.setattr(storage, "run_kubectl_raw", fake_raw)
 
     result = aks_check_storage("sub", "rg", "cluster")
 
@@ -275,11 +323,19 @@ def test_aks_check_storage_uses_a_single_batched_run_command(monkeypatch):
 
 
 def test_aks_check_storage_query_failure_is_not_hidden_as_healthy(monkeypatch):
-    """A failed PVC query must surface as a query_error and must NOT produce a false
-    'No storage issues detected' recommendation."""
-    batch = _healthy_batch()
-    batch["pvc"] = (1, "")
-    monkeypatch.setattr(storage, "run_kubectl_batch", lambda *a, **k: batch)
+    """A failed PVC query must surface as a query_error, must make storage_health INCOMPLETE
+    (not HEALTHY/BLOCKED/WARNING), and must NOT produce a false 'No storage issues detected'
+    recommendation."""
+    raw = _batch_raw_output(
+        {
+            "pvc": (1, ""),
+            "pv": (0, _items_json([])),
+            "storageclass": (0, _items_json([])),
+            "pods": (0, ""),
+            "events": (0, ""),
+        }
+    )
+    monkeypatch.setattr(storage, "run_kubectl_raw", lambda *a, **k: raw)
 
     result = aks_check_storage("sub", "rg", "cluster")
 
@@ -287,16 +343,25 @@ def test_aks_check_storage_query_failure_is_not_hidden_as_healthy(monkeypatch):
     assert result["warnings"] == []
     assert len(result["query_errors"]) == 1
     assert "pvc" in result["query_errors"][0]
+    assert result["storage_health"] == "INCOMPLETE"
     assert not any("No storage issues detected" in r for r in result["recommendations"])
     assert any("could not be executed" in r for r in result["recommendations"])
 
 
 def test_aks_check_storage_events_failure_stays_best_effort(monkeypatch):
     """Events failing must not crash the tool and must still populate events_available/error,
-    while also being visible in the unified query_errors list."""
-    batch = _healthy_batch()
-    batch["events"] = (1, "")
-    monkeypatch.setattr(storage, "run_kubectl_batch", lambda *a, **k: batch)
+    while also being visible in the unified query_errors list and forcing INCOMPLETE (not
+    HEALTHY)."""
+    raw = _batch_raw_output(
+        {
+            "pvc": (0, _items_json([])),
+            "pv": (0, _items_json([])),
+            "storageclass": (0, _items_json([])),
+            "pods": (0, ""),
+            "events": (1, ""),
+        }
+    )
+    monkeypatch.setattr(storage, "run_kubectl_raw", lambda *a, **k: raw)
 
     result = aks_check_storage("sub", "rg", "cluster")
 
@@ -304,3 +369,135 @@ def test_aks_check_storage_events_failure_stays_best_effort(monkeypatch):
     assert result["storage_events"]["error"] is not None
     assert len(result["query_errors"]) == 1
     assert "events" in result["query_errors"][0]
+    assert result["storage_health"] == "INCOMPLETE"
+
+
+def test_aks_check_storage_missing_pods_and_events_reports_incomplete_not_healthy(monkeypatch):
+    """Reproduces the real-cluster bug: pods/events sections entirely absent from the combined
+    batch output (as observed when AKS Run Command's own output-size limit truncated a
+    cluster-wide response) must yield storage_health == INCOMPLETE, never HEALTHY."""
+    raw = _batch_raw_output(
+        {
+            "pvc": (0, _items_json([])),
+            "pv": (0, _items_json([])),
+            "storageclass": (0, _items_json([])),
+        }
+    )  # pods/events sections are entirely missing, exactly as observed on the real cluster
+    monkeypatch.setattr(storage, "run_kubectl_raw", lambda *a, **k: raw)
+
+    result = aks_check_storage("sub", "rg", "cluster")
+
+    assert result["storage_health"] == "INCOMPLETE"
+    assert any("pods" in err for err in result["query_errors"])
+    assert any("events" in err for err in result["query_errors"])
+    assert not any("No storage issues detected" in r for r in result["recommendations"])
+
+
+# --- Compact pod/event jsonpath row parsing (2026-08-31 output-size fix) ---
+
+
+def test_parse_pod_storage_rows_compact_output_parsed_correctly():
+    raw = "payments|db-pod|Pending|FailedMount^Unable to mount volumes for pod~|invoices~\n"
+
+    pods, malformed = _parse_pod_storage_rows(raw)
+
+    assert malformed == 0
+    assert len(pods) == 1
+    pod = pods[0]
+    assert pod["metadata"]["namespace"] == "payments"
+    assert pod["metadata"]["name"] == "db-pod"
+    assert pod["status"]["phase"] == "Pending"
+    assert pod["status"]["containerStatuses"] == [
+        {"state": {"waiting": {"reason": "FailedMount", "message": "Unable to mount volumes for pod"}}}
+    ]
+    assert pod["spec"]["volumes"] == [{"persistentVolumeClaim": {"claimName": "invoices"}}]
+
+    # Round-trip through the real classification functions to prove the reconstructed shape works.
+    failures = find_pod_storage_failures(pods)
+    assert len(failures) == 1
+    assert failures[0]["namespace"] == "payments"
+
+
+def test_parse_pod_storage_rows_healthy_pod_has_no_containers_or_volumes():
+    raw = "payments|api-1|Running||\n"
+
+    pods, malformed = _parse_pod_storage_rows(raw)
+
+    assert malformed == 0
+    assert pods[0]["status"]["containerStatuses"] == []
+    assert pods[0]["spec"]["volumes"] == []
+
+
+def test_parse_pod_storage_rows_malformed_row_is_counted_not_silently_dropped():
+    raw = "payments|db-pod|Pending\nbillie|ok-pod|Running||\n"  # first row missing fields
+
+    pods, malformed = _parse_pod_storage_rows(raw)
+
+    assert malformed == 1
+    assert len(pods) == 1
+    assert pods[0]["metadata"]["name"] == "ok-pod"
+
+
+def test_parse_event_storage_rows_compact_output_parsed_correctly():
+    raw = "payments|Pod|db-pod|FailedAttachVolume|AttachVolume.Attach failed for volume pv-1|2026-08-30T00:00:00Z|\n"
+
+    events, malformed = _parse_event_storage_rows(raw)
+
+    assert malformed == 0
+    assert len(events) == 1
+    event = events[0]
+    assert event["reason"] == "FailedAttachVolume"
+    assert event["involvedObject"]["kind"] == "Pod"
+    assert event["involvedObject"]["name"] == "db-pod"
+
+    # Round-trip through the real classification function.
+    storage_events = find_storage_events(events)
+    assert len(storage_events) == 1
+    assert storage_events[0]["reason"] == "FailedAttachVolume"
+
+
+def test_parse_event_storage_rows_malformed_row_is_counted_not_silently_dropped():
+    raw = "payments|Pod|db-pod|FailedAttachVolume\n"  # missing trailing fields
+
+    events, malformed = _parse_event_storage_rows(raw)
+
+    assert malformed == 1
+    assert events == []
+
+
+def test_extract_pod_storage_rows_missing_label_is_a_query_error():
+    errors: list[str] = []
+
+    pods = _extract_pod_storage_rows({}, errors)
+
+    assert pods == []
+    assert "pods" in errors[0]
+    assert "no result returned" in errors[0]
+
+
+def test_extract_event_storage_rows_missing_label_is_a_query_error():
+    errors: list[str] = []
+
+    events = _extract_event_storage_rows({}, errors)
+
+    assert events == []
+    assert "events" in errors[0]
+    assert "no result returned" in errors[0]
+
+
+def test_extract_pod_storage_rows_nonzero_exit_is_a_query_error():
+    errors: list[str] = []
+
+    pods = _extract_pod_storage_rows({"pods": (1, "")}, errors)
+
+    assert pods == []
+    assert "kubectl exited with code 1" in errors[0]
+
+
+def test_parse_storage_batch_output_extracts_all_sections():
+    raw = _healthy_raw_output()
+
+    batch = _parse_storage_batch_output(raw)
+
+    assert set(batch.keys()) == {"pvc", "pv", "storageclass", "pods", "events"}
+    assert batch["pods"] == (0, "")

@@ -54,6 +54,9 @@ def aks_validate_upgrade_readiness(
             pod_health = aks_check_pod_health(subscription_id, resource_group, cluster_name, namespace)
             if pod_health.get("unhealthy_pods"):
                 blockers.append("Unhealthy pods detected.")
+            elif pod_health.get("query_errors"):
+                # A failed/incomplete pod query must never be silently treated as healthy.
+                blockers.append("Pod health could not be fully checked; query_errors present.")
         except Exception as exc:  # noqa: BLE001
             deep_check_errors.append(f"pod_health_check_failed: {exc}")
 
