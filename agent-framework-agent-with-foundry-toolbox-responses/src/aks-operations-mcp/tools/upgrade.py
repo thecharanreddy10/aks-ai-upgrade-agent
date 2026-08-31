@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from tools.common import get_container_service_client
+from tools.deprecated_apis import aks_check_deprecated_apis
 from tools.storage import aks_check_storage
 from tools.validation import aks_check_node_health, aks_check_pdb, aks_check_pod_health
 
@@ -19,8 +20,12 @@ def aks_validate_upgrade_readiness(
     maintenance_window_start_utc: str | None = None,
     maintenance_window_end_utc: str | None = None,
     check_mode: str = "quick",
+    target_kubernetes_version: str | None = None,
 ) -> dict[str, Any]:
     """Run pre-upgrade health and safety checks.
+
+    target_kubernetes_version is passed through to the deprecated-API check; if omitted, that
+    check falls back to the cluster's own current version (see tools.deprecated_apis).
 
     Returns a structured readiness report and blocking reasons.
     """
@@ -31,6 +36,7 @@ def aks_validate_upgrade_readiness(
     pod_health: dict[str, Any] = {}
     pdb_health: dict[str, Any] = {}
     storage_health: dict[str, Any] = {}
+    deprecated_api_health: dict[str, Any] = {}
     deep_check_errors: list[str] = []
 
     blockers: list[str] = []
@@ -65,6 +71,19 @@ def aks_validate_upgrade_readiness(
         except Exception as exc:  # noqa: BLE001
             deep_check_errors.append(f"storage_health_check_failed: {exc}")
 
+        try:
+            deprecated_api_health = aks_check_deprecated_apis(
+                subscription_id,
+                resource_group,
+                cluster_name,
+                target_version=target_kubernetes_version,
+                namespace=namespace,
+            )
+            blockers.extend(deprecated_api_health.get("blockers", []))
+            warnings.extend(deprecated_api_health.get("warnings", []))
+        except Exception as exc:  # noqa: BLE001
+            deep_check_errors.append(f"deprecated_api_check_failed: {exc}")
+
         if deep_check_errors:
             blockers.append("One or more deep checks failed to execute.")
     else:
@@ -97,6 +116,7 @@ def aks_validate_upgrade_readiness(
         "pod_health": pod_health,
         "pdb_health": pdb_health,
         "storage_health": storage_health,
+        "deprecated_api_health": deprecated_api_health,
     }
 
 
@@ -128,6 +148,7 @@ def aks_upgrade_node_pool(
         maintenance_window_start_utc=maintenance_window_start_utc,
         maintenance_window_end_utc=maintenance_window_end_utc,
         check_mode=check_mode,
+        target_kubernetes_version=kubernetes_version,
     )
 
     if not readiness["readiness"]["is_ready"]:

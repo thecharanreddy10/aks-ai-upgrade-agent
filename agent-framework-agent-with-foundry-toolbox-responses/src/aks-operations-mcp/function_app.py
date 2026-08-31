@@ -13,6 +13,7 @@ import azure.functions as func
 
 from tools.discovery import aks_get_available_upgrades, aks_get_cluster_details, aks_get_node_pools
 from tools.storage import aks_check_storage
+from tools.deprecated_apis import aks_check_deprecated_apis
 from tools.upgrade import aks_upgrade_node_pool, aks_validate_upgrade_readiness
 from tools.validation import aks_check_node_health, aks_check_pdb, aks_check_pod_health
 
@@ -28,6 +29,7 @@ TOOLS: dict[str, Callable[..., dict[str, Any]]] = {
     "aks_validate_upgrade_readiness": aks_validate_upgrade_readiness,
     "aks_upgrade_node_pool": aks_upgrade_node_pool,
     "aks_check_storage": aks_check_storage,
+    "aks_check_deprecated_apis": aks_check_deprecated_apis,
 }
 
 TOOL_SCHEMAS = {
@@ -97,6 +99,7 @@ TOOL_SCHEMAS = {
             "maintenance_window_start_utc": {"type": ["string", "null"]},
             "maintenance_window_end_utc": {"type": ["string", "null"]},
             "check_mode": {"type": "string", "enum": ["quick", "full"]},
+            "target_kubernetes_version": {"type": ["string", "null"]},
         },
         "required": ["subscription_id", "resource_group", "cluster_name"],
     },
@@ -123,6 +126,17 @@ TOOL_SCHEMAS = {
             "subscription_id": {"type": "string"},
             "resource_group": {"type": "string"},
             "cluster_name": {"type": "string"},
+            "namespace": {"type": ["string", "null"]},
+        },
+        "required": ["subscription_id", "resource_group", "cluster_name"],
+    },
+    "aks_check_deprecated_apis": {
+        "type": "object",
+        "properties": {
+            "subscription_id": {"type": "string"},
+            "resource_group": {"type": "string"},
+            "cluster_name": {"type": "string"},
+            "target_version": {"type": ["string", "null"]},
             "namespace": {"type": ["string", "null"]},
         },
         "required": ["subscription_id", "resource_group", "cluster_name"],

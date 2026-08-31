@@ -15,6 +15,7 @@ In Phase 4, it also includes an Azure Functions entrypoint (`function_app.py`) a
 - `aks_validate_upgrade_readiness`
 - `aks_upgrade_node_pool`
 - `aks_check_storage`
+- `aks_check_deprecated_apis`
 
 ## Upgrade guardrails
 

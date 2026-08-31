@@ -27,6 +27,16 @@ def _healthy_pdb_health(*_args: Any, **_kwargs: Any) -> dict:
     return {"cluster_name": "c", "scope": "all-namespaces", "total_pdbs": 0, "blocking_pdbs": [], "is_upgrade_safe": True}
 
 
+def _healthy_deprecated_api_health(*_args: Any, **_kwargs: Any) -> dict:
+    return {
+        "deprecated_api_health": "HEALTHY",
+        "target_kubernetes_version": "1.28.0",
+        "findings": [],
+        "blockers": [],
+        "warnings": [],
+    }
+
+
 def _storage_health_from(pvc_items=(), pv_items=(), pod_items=()) -> dict:
     """Build a storage_health payload the same way aks_check_storage does, without kubectl I/O."""
     pod_storage_failures = find_pod_storage_failures(list(pod_items))
@@ -61,10 +71,15 @@ def _patch_healthy_baseline(monkeypatch) -> None:
     monkeypatch.setattr("tools.upgrade.aks_check_node_health", _healthy_node_health)
     monkeypatch.setattr("tools.upgrade.aks_check_pod_health", _healthy_pod_health)
     monkeypatch.setattr("tools.upgrade.aks_check_pdb", _healthy_pdb_health)
+    monkeypatch.setattr("tools.upgrade.aks_check_deprecated_apis", _healthy_deprecated_api_health)
 
 
 def _patch_storage(monkeypatch, storage_health: dict) -> None:
     monkeypatch.setattr("tools.upgrade.aks_check_storage", lambda *a, **k: storage_health)
+
+
+def _patch_deprecated_apis(monkeypatch, deprecated_api_health: dict) -> None:
+    monkeypatch.setattr("tools.upgrade.aks_check_deprecated_apis", lambda *a, **k: deprecated_api_health)
 
 
 def test_healthy_storage_does_not_block_readiness(monkeypatch):
@@ -141,3 +156,36 @@ def test_unrelated_pod_failure_is_not_a_storage_blocker(monkeypatch):
 
     assert result["storage_health"]["blockers"] == []
     assert result["readiness"]["is_ready"] is True
+
+
+def test_deprecated_api_findings_are_included_in_readiness(monkeypatch):
+    """Test 6: a removed-API-in-target finding from aks_check_deprecated_apis blocks readiness,
+    while a deprecated-but-still-served finding only warns (mirrors the storage severity model)."""
+    _patch_healthy_baseline(monkeypatch)
+    _patch_deprecated_apis(
+        monkeypatch,
+        {
+            "deprecated_api_health": "BLOCKED",
+            "target_kubernetes_version": "1.25.0",
+            "findings": [
+                {
+                    "namespace": "payments",
+                    "name": "db-pdb",
+                    "kind": "PodDisruptionBudget",
+                    "api_version": "policy/v1beta1",
+                    "severity": "BLOCKER",
+                    "status": "REMOVED_IN_TARGET",
+                }
+            ],
+            "blockers": ["PodDisruptionBudget payments/db-pdb (policy/v1beta1): removed in target version 1.25.0."],
+            "warnings": [],
+        },
+    )
+
+    result = aks_validate_upgrade_readiness(
+        "sub", "rg", "cluster", check_mode="full", target_kubernetes_version="1.25.0"
+    )
+
+    assert result["readiness"]["is_ready"] is False
+    assert any("db-pdb" in blocker for blocker in result["readiness"]["blockers"])
+    assert result["deprecated_api_health"]["deprecated_api_health"] == "BLOCKED"

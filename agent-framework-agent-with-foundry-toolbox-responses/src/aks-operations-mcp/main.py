@@ -22,6 +22,7 @@ from tools.validation import (
     aks_check_pod_health as check_pod_health_impl,
 )
 from tools.storage import aks_check_storage as check_storage_impl
+from tools.deprecated_apis import aks_check_deprecated_apis as check_deprecated_apis_impl
 
 TOOLS = {
     "aks_get_cluster_details": get_cluster_details_impl,
@@ -33,6 +34,7 @@ TOOLS = {
     "aks_validate_upgrade_readiness": validate_upgrade_readiness_impl,
     "aks_upgrade_node_pool": upgrade_node_pool_impl,
     "aks_check_storage": check_storage_impl,
+    "aks_check_deprecated_apis": check_deprecated_apis_impl,
 }
 
 TOOL_SCHEMAS = {
@@ -102,6 +104,7 @@ TOOL_SCHEMAS = {
             "maintenance_window_start_utc": {"type": ["string", "null"]},
             "maintenance_window_end_utc": {"type": ["string", "null"]},
             "check_mode": {"type": "string", "enum": ["quick", "full"]},
+            "target_kubernetes_version": {"type": ["string", "null"]},
         },
         "required": ["subscription_id", "resource_group", "cluster_name"],
     },
@@ -128,6 +131,17 @@ TOOL_SCHEMAS = {
             "subscription_id": {"type": "string"},
             "resource_group": {"type": "string"},
             "cluster_name": {"type": "string"},
+            "namespace": {"type": ["string", "null"]},
+        },
+        "required": ["subscription_id", "resource_group", "cluster_name"],
+    },
+    "aks_check_deprecated_apis": {
+        "type": "object",
+        "properties": {
+            "subscription_id": {"type": "string"},
+            "resource_group": {"type": "string"},
+            "cluster_name": {"type": "string"},
+            "target_version": {"type": ["string", "null"]},
             "namespace": {"type": ["string", "null"]},
         },
         "required": ["subscription_id", "resource_group", "cluster_name"],
