@@ -21,6 +21,14 @@ unavailable/removed API (non-zero exit) is never confused with zero matching obj
 count 0). This does trade away the previous per-object namespace/name detail (only counts are
 now reported per API version) in exchange for the single-invocation design; classification
 accuracy (BLOCKER/WARNING) is unchanged.
+
+Correctness note (2026-08-31): real-cluster validation surfaced a bug where entries with
+unavailable/unqueryable APIs (query_errors) could coexist with a "HEALTHY" / "no usage detected"
+result, incorrectly implying usage had been confirmed absent. Fixed: determine_deprecated_api_health
+now returns "INCOMPLETE" (not "HEALTHY") when there are no confirmed findings but some entries
+could not be checked, and the "no usage detected" recommendation is never emitted when
+query_errors is non-empty. A confirmed BLOCKER/WARNING finding still takes precedence over
+INCOMPLETE, since it is more actionable - query_errors remain visible in the result either way.
 """
 
 from __future__ import annotations
@@ -121,11 +129,25 @@ def classify_entry(entry: dict[str, Any], target_major_minor: tuple[int, int], t
     return None
 
 
-def determine_deprecated_api_health(blockers: list[str], warnings: list[str]) -> str:
+def determine_deprecated_api_health(
+    blockers: list[str],
+    warnings: list[str],
+    query_errors: list[str] | None = None,
+) -> str:
+    """Classify overall deprecated-API health.
+
+    Precedence: a confirmed BLOCKER/WARNING finding is always reported as such, even if some
+    other entries were unqueryable (those are still preserved in query_errors for transparency).
+    Only when there are NO confirmed findings AND some entries could not be checked does this
+    return INCOMPLETE - an unavailable/unqueryable API must never be read as "HEALTHY", since
+    that would incorrectly imply usage was confirmed absent when it simply could not be checked.
+    """
     if blockers:
         return "BLOCKED"
     if warnings:
         return "WARNING"
+    if query_errors:
+        return "INCOMPLETE"
     return "HEALTHY"
 
 
@@ -190,6 +212,11 @@ def aks_check_deprecated_apis(
     If target_version is not supplied, the cluster's own current kubernetes_version is used
     (via aks_get_cluster_details) as the safest non-invented reference point - this reports
     what is already deprecated/removed as of today rather than guessing a future upgrade target.
+
+    deprecated_api_health is one of "BLOCKED" / "WARNING" / "INCOMPLETE" / "HEALTHY". "INCOMPLETE"
+    means no BLOCKER/WARNING findings were confirmed, but some API queries could not be executed
+    (see query_errors) - this must never be conflated with "HEALTHY", since an unavailable API is
+    not evidence that no deprecated resources exist.
     """
     if namespace is not None:
         _validate_namespace(namespace)
@@ -279,8 +306,8 @@ def aks_check_deprecated_apis(
     if warnings:
         recommendations.append("Plan migration for deprecated-but-still-served API versions.")
     if query_errors:
-        recommendations.append("Some deprecated-API checks could not be executed; results may be incomplete.")
-    if not blockers and not warnings:
+        recommendations.append("Deprecated API assessment is incomplete because some API queries could not be executed.")
+    if not blockers and not warnings and not query_errors:
         recommendations.append("No deprecated or removed Kubernetes API usage detected for the target version.")
 
     return {
@@ -290,7 +317,7 @@ def aks_check_deprecated_apis(
         "scope": namespace or "all-namespaces",
         "target_kubernetes_version": resolved_target_version,
         "target_version_source": target_version_source,
-        "deprecated_api_health": determine_deprecated_api_health(blockers, warnings),
+        "deprecated_api_health": determine_deprecated_api_health(blockers, warnings, query_errors),
         "checked_api_versions": checked_api_versions,
         "run_command_invocations": run_command_invocations,
         "findings": findings,

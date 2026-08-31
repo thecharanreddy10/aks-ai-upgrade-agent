@@ -71,6 +71,7 @@ def test_no_deprecated_apis_detected(monkeypatch):
     assert result["warnings"] == []
     assert result["query_errors"] == []
     assert result["run_command_invocations"] == 1
+    assert "No deprecated or removed Kubernetes API usage detected" in result["recommendations"][0]
 
 
 def test_deprecated_api_still_served_is_a_warning(monkeypatch):
@@ -124,7 +125,9 @@ def test_multiple_findings_across_api_versions(monkeypatch):
 
 def test_api_unavailable_is_distinguished_from_no_objects_found(monkeypatch):
     """Test 5: a non-zero kubectl exit (API unavailable/removed) must NOT be read as 'no objects
-    found' - it should be surfaced as a query error, not silently treated as evidence of health."""
+    found' - it should be surfaced as a query error, not silently treated as evidence of health.
+    Correctness fix: overall health must be INCOMPLETE (not HEALTHY), and the "no usage detected"
+    recommendation must never be emitted while query_errors is non-empty."""
     _patch_matrix(monkeypatch)
     # Entry 0 (PDB) is unavailable on this cluster (non-zero exit); entry 1 (Ingress) is available, empty.
     monkeypatch.setattr(deprecated_apis, "run_kubectl_raw", lambda *a, **k: _batch_output((0, 1, 0), (1, 0, 0)))
@@ -135,6 +138,30 @@ def test_api_unavailable_is_distinguished_from_no_objects_found(monkeypatch):
     assert len(result["query_errors"]) == 1
     assert "not available" in result["query_errors"][0]
     assert "PodDisruptionBudget" in result["query_errors"][0]
+    assert result["deprecated_api_health"] == "INCOMPLETE"
+    assert not any("No deprecated or removed Kubernetes API usage detected" in r for r in result["recommendations"])
+    assert any("incomplete" in r.lower() for r in result["recommendations"])
+
+
+def test_query_errors_alongside_real_findings_preserve_both(monkeypatch):
+    """Test 4/5: a confirmed BLOCKER finding must still be reported even when a DIFFERENT entry
+    was unqueryable - the finding is not suppressed, and the incompleteness is not hidden either."""
+    _patch_matrix(monkeypatch)
+    # Entry 0 (PDB) found with real objects (BLOCKER at this target); entry 1 (Ingress) unavailable.
+    monkeypatch.setattr(deprecated_apis, "run_kubectl_raw", lambda *a, **k: _batch_output((0, 0, 2), (1, 1, 0)))
+
+    result = aks_check_deprecated_apis("sub", "rg", "cluster", target_version="1.25.0")
+
+    assert len(result["blockers"]) == 1
+    assert result["findings"][0]["kind"] == "PodDisruptionBudget"
+    assert result["findings"][0]["count"] == 2
+    assert len(result["query_errors"]) == 1
+    assert "Ingress" in result["query_errors"][0]
+    # A real, confirmed finding takes precedence over INCOMPLETE - it is the more actionable signal.
+    assert result["deprecated_api_health"] == "BLOCKED"
+    assert not any("No deprecated or removed Kubernetes API usage detected" in r for r in result["recommendations"])
+    assert any("Migrate resources using removed API versions" in r for r in result["recommendations"])
+    assert any("incomplete" in r.lower() for r in result["recommendations"])
 
 
 def test_missing_target_version_falls_back_to_cluster_current_version(monkeypatch):
@@ -168,6 +195,10 @@ def test_determine_deprecated_api_health():
     assert determine_deprecated_api_health([], []) == "HEALTHY"
     assert determine_deprecated_api_health([], ["w"]) == "WARNING"
     assert determine_deprecated_api_health(["b"], ["w"]) == "BLOCKED"
+    assert determine_deprecated_api_health([], [], []) == "HEALTHY"
+    assert determine_deprecated_api_health([], [], ["api unavailable"]) == "INCOMPLETE"
+    assert determine_deprecated_api_health(["b"], [], ["api unavailable"]) == "BLOCKED"
+    assert determine_deprecated_api_health([], ["w"], ["api unavailable"]) == "WARNING"
 
 
 def test_parse_batch_output_extracts_multiple_entries():
