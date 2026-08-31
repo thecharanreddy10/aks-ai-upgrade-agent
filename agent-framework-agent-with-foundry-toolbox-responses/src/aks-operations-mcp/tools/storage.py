@@ -2,13 +2,26 @@
 
 Read-only diagnostics for PVCs, PVs, StorageClasses, and storage-related pod/event
 failures that could block application pods from becoming healthy during an upgrade.
+
+Performance note (2026-08-31): the 5 kubectl queries below (PVCs, PVs, StorageClasses, pods,
+events) were originally issued as 5 separate AKS Run Command invocations (measured baseline:
+~159s namespace-scoped), each paying AKS Run Command's ~25-35s per-invocation overhead. They are
+now batched into a SINGLE Run Command (see tools.common.run_kubectl_batch), following the same
+principle used to optimize aks_check_deprecated_apis (17 calls -> 1). Each query's kubectl exit
+code is tracked separately from its output, so a genuine query failure is preserved as an explicit
+query_errors entry rather than silently treated as an empty/healthy result. All existing
+classification functions (classify_pvcs, classify_pvs, find_pod_storage_failures,
+find_storage_events, summarize_storage_classes) are unchanged and still operate on full `-o json`
+item lists, preserving the existing output contract.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
 
-from tools.common import run_kubectl_json
+from tools.common import run_kubectl_batch
 
 # Event/waiting reasons that are unambiguously storage-related on their own.
 _STRONG_STORAGE_REASONS = {
@@ -283,30 +296,92 @@ def determine_storage_health(blockers: list[str], warnings: list[str]) -> str:
     return "HEALTHY"
 
 
+_NAMESPACE_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+
+
+def _validate_namespace(namespace: str) -> None:
+    """Reject anything that isn't a valid Kubernetes namespace name (RFC 1123 label).
+
+    namespace ends up embedded in a shell command run via AKS Run Command, so this also
+    prevents shell-metacharacter injection via this parameter.
+    """
+    if not isinstance(namespace, str) or len(namespace) > 63 or not _NAMESPACE_RE.match(namespace):
+        raise ValueError(f"Invalid Kubernetes namespace: {namespace!r}")
+
+
+def _extract_items(label: str, batch: dict[str, tuple[int, str]], query_errors: list[str]) -> list[dict[str, Any]]:
+    """Pull a resource's `items` list out of a batched query result, or record why it's missing.
+
+    A non-zero exit code or unparseable JSON is appended to query_errors and treated as "unknown",
+    never as a silent empty/healthy result - the caller must be able to see that this specific
+    check could not be confirmed.
+    """
+    entry = batch.get(label)
+    if entry is None:
+        query_errors.append(f"{label}: no result returned in the batched output.")
+        return []
+
+    exit_code, raw_json = entry
+    if exit_code != 0:
+        query_errors.append(f"{label}: kubectl exited with code {exit_code}; query could not be executed.")
+        return []
+    if not raw_json.strip():
+        return []
+
+    try:
+        return json.loads(raw_json).get("items", [])
+    except json.JSONDecodeError as exc:
+        truncation_hint = (
+            " Output may be truncated near AKS Run Command's output size limit; retry with a "
+            "narrower namespace scope."
+            if len(raw_json) >= 500_000
+            else ""
+        )
+        query_errors.append(f"{label}: failed to parse kubectl JSON output ({exc}).{truncation_hint}")
+        return []
+
+
 def aks_check_storage(
     subscription_id: str,
     resource_group: str,
     cluster_name: str,
     namespace: str | None = None,
 ) -> dict[str, Any]:
-    """Check PVC/PV/StorageClass/pod/event health for upgrade-blocking storage issues."""
+    """Check PVC/PV/StorageClass/pod/event health for upgrade-blocking storage issues.
+
+    All 5 queries are issued in a single AKS Run Command invocation (see module docstring). If an
+    individual query fails, its data is treated as unknown (not empty) and recorded in query_errors;
+    events remain best-effort as before (events_available/error), but are also reflected there.
+    """
+    if namespace is not None:
+        _validate_namespace(namespace)
+
     ns_flag = f"-n {namespace}" if namespace else "-A"
 
-    pvc_items = run_kubectl_json(subscription_id, resource_group, cluster_name, f"get pvc {ns_flag}").get("items", [])
-    pv_items = run_kubectl_json(subscription_id, resource_group, cluster_name, "get pv").get("items", [])
-    sc_items = run_kubectl_json(subscription_id, resource_group, cluster_name, "get storageclass").get("items", [])
-    pod_items = run_kubectl_json(subscription_id, resource_group, cluster_name, f"get pods {ns_flag}").get("items", [])
+    batch = run_kubectl_batch(
+        subscription_id,
+        resource_group,
+        cluster_name,
+        {
+            "pvc": f"get pvc {ns_flag}",
+            "pv": "get pv",
+            "storageclass": "get storageclass",
+            "pods": f"get pods {ns_flag}",
+            "events": f"get events {ns_flag}",
+        },
+    )
 
-    events_available = True
-    events_error: str | None = None
-    event_items: list[dict[str, Any]] = []
-    try:
-        event_items = run_kubectl_json(subscription_id, resource_group, cluster_name, f"get events {ns_flag}").get(
-            "items", []
-        )
-    except Exception as exc:  # noqa: BLE001 - events are best-effort, never a hard dependency
-        events_available = False
-        events_error = str(exc)
+    query_errors: list[str] = []
+    pvc_items = _extract_items("pvc", batch, query_errors)
+    pv_items = _extract_items("pv", batch, query_errors)
+    sc_items = _extract_items("storageclass", batch, query_errors)
+    pod_items = _extract_items("pods", batch, query_errors)
+
+    events_query_errors: list[str] = []
+    event_items = _extract_items("events", batch, events_query_errors)
+    events_available = not events_query_errors
+    events_error = events_query_errors[0] if events_query_errors else None
+    query_errors.extend(events_query_errors)
 
     storage_classes, storage_classes_by_name = summarize_storage_classes(sc_items)
     pod_storage_failures = find_pod_storage_failures(pod_items)
@@ -341,7 +416,9 @@ def aks_check_storage(
         recommendations.append("Investigate blocking PVC/PV/pod storage issues before proceeding with an upgrade.")
     if not events_available:
         recommendations.append("Kubernetes events could not be retrieved; storage diagnostics may be incomplete.")
-    if not blockers and not warnings:
+    if query_errors:
+        recommendations.append("Some storage checks could not be executed; results may be incomplete.")
+    if not blockers and not warnings and not query_errors:
         recommendations.append("No storage issues detected.")
 
     return {
@@ -360,7 +437,10 @@ def aks_check_storage(
             "events": storage_events,
             "error": events_error,
         },
+        "run_command_invocations": 1,
+        "query_errors": query_errors,
         "blockers": blockers,
         "warnings": warnings,
         "recommendations": recommendations,
     }
+

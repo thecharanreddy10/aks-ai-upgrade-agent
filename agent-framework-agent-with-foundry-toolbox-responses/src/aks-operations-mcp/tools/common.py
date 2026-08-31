@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 from azure.identity import DefaultAzureCredential
@@ -120,3 +121,37 @@ def run_kubectl_raw(
     if not raw_logs:
         raise RuntimeError("AKS run command did not return logs output.")
     return raw_logs
+
+
+_BATCH_SECTION_RE = re.compile(r"===BEGIN:(?P<label>[^=]+)===\n(?P<body>.*?)\n===END:(?P=label):EXIT=(?P<code>-?\d+)===", re.DOTALL)
+
+
+def run_kubectl_batch(
+    subscription_id: str,
+    resource_group: str,
+    cluster_name: str,
+    queries: dict[str, str],
+) -> dict[str, tuple[int, str]]:
+    """Run multiple `kubectl get ... -o json` queries in a SINGLE AKS Run Command invocation.
+
+    `queries` maps a caller-chosen label to kubectl arguments (without `-o json`, which is added
+    automatically). Returns {label: (exit_code, raw_json_text)}. Each query's kubectl exit code is
+    captured via command substitution (never through a pipe, which would lose it), so callers can
+    distinguish a genuine query failure (non-zero exit) from a valid empty result - a failed query
+    must be treated as an explicit error, never as an empty/healthy result.
+    """
+    lines: list[str] = []
+    for label, kubectl_args in queries.items():
+        lines.append(f"RAW=$(kubectl {kubectl_args} -o json 2>/dev/null)")
+        lines.append("CODE=$?")
+        lines.append(f"echo '===BEGIN:{label}==='")
+        lines.append('echo "$RAW"')
+        lines.append(f"echo '===END:{label}:EXIT='$CODE'==='")
+    script = "\n".join(lines)
+
+    raw_output = run_kubectl_raw(subscription_id, resource_group, cluster_name, script)
+
+    return {
+        match.group("label"): (int(match.group("code")), match.group("body"))
+        for match in _BATCH_SECTION_RE.finditer(raw_output)
+    }

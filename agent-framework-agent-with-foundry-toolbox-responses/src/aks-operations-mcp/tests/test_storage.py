@@ -6,7 +6,15 @@ tools.storage - no Azure credentials or live cluster required.
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
+from tools import storage
 from tools.storage import (
+    _extract_items,
+    _validate_namespace,
+    aks_check_storage,
     classify_pvcs,
     classify_pvs,
     determine_storage_health,
@@ -187,3 +195,112 @@ def test_storage_class_summary_is_informational_only():
 
     assert summary["total"] == 1
     assert by_name["managed-premium"]["volume_binding_mode"] == "WaitForFirstConsumer"
+
+
+# --- Batching/parser tests for the single-Run-Command aks_check_storage (2026-08-31) ---
+
+
+def _items_json(items: list[dict]) -> str:
+    return json.dumps({"items": items})
+
+
+def _healthy_batch() -> dict[str, tuple[int, str]]:
+    empty = _items_json([])
+    return {"pvc": (0, empty), "pv": (0, empty), "storageclass": (0, empty), "pods": (0, empty), "events": (0, empty)}
+
+
+def test_extract_items_parses_successful_query():
+    batch = {"pvc": (0, _items_json([{"metadata": {"name": "a"}}]))}
+    errors: list[str] = []
+
+    items = _extract_items("pvc", batch, errors)
+
+    assert items == [{"metadata": {"name": "a"}}]
+    assert errors == []
+
+
+def test_extract_items_nonzero_exit_is_a_query_error_not_an_empty_result():
+    """A failed query must be preserved as an explicit error, never silently treated as empty."""
+    batch = {"pvc": (1, "")}
+    errors: list[str] = []
+
+    items = _extract_items("pvc", batch, errors)
+
+    assert items == []
+    assert len(errors) == 1
+    assert "kubectl exited with code 1" in errors[0]
+
+
+def test_extract_items_missing_label_is_a_query_error():
+    errors: list[str] = []
+
+    items = _extract_items("pvc", {}, errors)
+
+    assert items == []
+    assert "no result returned" in errors[0]
+
+
+def test_extract_items_malformed_json_is_a_query_error():
+    batch = {"pvc": (0, "{not valid json")}
+    errors: list[str] = []
+
+    items = _extract_items("pvc", batch, errors)
+
+    assert items == []
+    assert "failed to parse kubectl JSON output" in errors[0]
+
+
+def test_invalid_namespace_raises():
+    with pytest.raises(ValueError):
+        _validate_namespace("not; a valid namespace")
+
+
+def test_aks_check_storage_uses_a_single_batched_run_command(monkeypatch):
+    """All 5 queries must be issued via exactly one run_kubectl_batch call."""
+    call_count = {"n": 0}
+
+    def fake_batch(subscription_id, resource_group, cluster_name, queries):
+        call_count["n"] += 1
+        assert set(queries.keys()) == {"pvc", "pv", "storageclass", "pods", "events"}
+        return _healthy_batch()
+
+    monkeypatch.setattr(storage, "run_kubectl_batch", fake_batch)
+
+    result = aks_check_storage("sub", "rg", "cluster")
+
+    assert call_count["n"] == 1
+    assert result["run_command_invocations"] == 1
+    assert result["storage_health"] == "HEALTHY"
+    assert result["query_errors"] == []
+
+
+def test_aks_check_storage_query_failure_is_not_hidden_as_healthy(monkeypatch):
+    """A failed PVC query must surface as a query_error and must NOT produce a false
+    'No storage issues detected' recommendation."""
+    batch = _healthy_batch()
+    batch["pvc"] = (1, "")
+    monkeypatch.setattr(storage, "run_kubectl_batch", lambda *a, **k: batch)
+
+    result = aks_check_storage("sub", "rg", "cluster")
+
+    assert result["blockers"] == []
+    assert result["warnings"] == []
+    assert len(result["query_errors"]) == 1
+    assert "pvc" in result["query_errors"][0]
+    assert not any("No storage issues detected" in r for r in result["recommendations"])
+    assert any("could not be executed" in r for r in result["recommendations"])
+
+
+def test_aks_check_storage_events_failure_stays_best_effort(monkeypatch):
+    """Events failing must not crash the tool and must still populate events_available/error,
+    while also being visible in the unified query_errors list."""
+    batch = _healthy_batch()
+    batch["events"] = (1, "")
+    monkeypatch.setattr(storage, "run_kubectl_batch", lambda *a, **k: batch)
+
+    result = aks_check_storage("sub", "rg", "cluster")
+
+    assert result["storage_events"]["events_available"] is False
+    assert result["storage_events"]["error"] is not None
+    assert len(result["query_errors"]) == 1
+    assert "events" in result["query_errors"][0]
